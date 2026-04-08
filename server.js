@@ -2,15 +2,8 @@ import { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 8765;
 
-// Room = { pc: WebSocket, phone: WebSocket }
+// Room = { pc: WebSocket | null, phone: WebSocket | null }
 const rooms = new Map();
-
-function generateCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code = "";
-  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code.slice(0, 3) + "-" + code.slice(3);
-}
 
 const wss = new WebSocketServer({ port: PORT });
 
@@ -31,36 +24,74 @@ wss.on("connection", (ws) => {
         const msg = JSON.parse(text);
 
         if (msg.type === "register_pc") {
-          // PC wants a new room
-          const code = generateCode();
-          rooms.set(code, { pc: ws, phone: null });
+          const pairId = msg.pair_id?.toUpperCase();
+          if (!pairId) {
+            ws.send(JSON.stringify({ type: "error", message: "pair_id required" }));
+            ws.close();
+            return;
+          }
+
+          let room = rooms.get(pairId);
+          if (room) {
+            // Room exists — update PC socket, close old one if stale
+            if (room.pc && room.pc !== ws && room.pc.readyState === 1) {
+              try { room.pc.close(); } catch {}
+            }
+            room.pc = ws;
+          } else {
+            room = { pc: ws, phone: null };
+            rooms.set(pairId, room);
+          }
+
           role = "pc";
-          roomCode = code;
-          ws.send(JSON.stringify({ type: "room_code", code }));
-          console.log(`[Relay] PC registered, room: ${code}`);
+          roomCode = pairId;
+          ws.send(JSON.stringify({ type: "room_code", code: pairId }));
+          console.log(`[Relay] PC registered, pair_id: ${pairId}`);
+
+          // If phone was already waiting in this room
+          if (room.phone?.readyState === 1) {
+            room.phone.send(JSON.stringify({ type: "joined", code: pairId }));
+            ws.send(JSON.stringify({ type: "phone_connected" }));
+          }
           return;
         }
 
         if (msg.type === "join_room") {
-          // Phone wants to join a room
           const code = msg.code?.toUpperCase();
-          const room = rooms.get(code);
-          if (!room) {
-            ws.send(JSON.stringify({ type: "error", message: "Room not found" }));
+          if (!code) {
+            ws.send(JSON.stringify({ type: "error", message: "code required" }));
             ws.close();
             return;
           }
-          // If there's already a phone, replace it (handles stale connections after network change)
-          if (room.phone && room.phone.readyState === 1) {
+
+          let room = rooms.get(code);
+
+          if (!room) {
+            // No room yet — create a waiting room (phone waits for PC)
+            room = { pc: null, phone: ws };
+            rooms.set(code, room);
+            role = "phone";
+            roomCode = code;
+            ws.send(JSON.stringify({ type: "waiting", code }));
+            console.log(`[Relay] Phone waiting in room: ${code}`);
+            return;
+          }
+
+          // Room exists — replace any stale phone connection
+          if (room.phone && room.phone !== ws && room.phone.readyState === 1) {
             try { room.phone.close(); } catch {}
           }
           room.phone = ws;
           role = "phone";
           roomCode = code;
-          ws.send(JSON.stringify({ type: "joined", code }));
-          // Notify PC that phone connected
+
           if (room.pc?.readyState === 1) {
+            // PC is here — pair immediately
+            ws.send(JSON.stringify({ type: "joined", code }));
             room.pc.send(JSON.stringify({ type: "phone_connected" }));
+          } else {
+            // PC not connected yet — wait
+            ws.send(JSON.stringify({ type: "waiting", code }));
           }
           console.log(`[Relay] Phone joined room: ${code}`);
           return;
@@ -90,18 +121,26 @@ wss.on("connection", (ws) => {
     console.log(`[Relay] ${role} disconnected from room ${roomCode}`);
 
     if (role === "pc") {
-      // PC disconnected → destroy room, notify and close phone
+      room.pc = null;
+      // Notify phone that PC left
       if (room.phone?.readyState === 1) {
         room.phone.send(JSON.stringify({ type: "peer_disconnected" }));
-        room.phone.close();
       }
-      rooms.delete(roomCode);
+      // Delete room only if both are gone
+      if (!room.phone || room.phone.readyState !== 1) {
+        rooms.delete(roomCode);
+        console.log(`[Relay] Room ${roomCode} deleted (empty)`);
+      }
     } else if (role === "phone") {
-      // Phone disconnected → keep room alive, just clear phone slot
-      // Phone can rejoin with same code after network change
       room.phone = null;
+      // Notify PC that phone left
       if (room.pc?.readyState === 1) {
         room.pc.send(JSON.stringify({ type: "peer_disconnected" }));
+      }
+      // Delete room only if both are gone
+      if (!room.pc || room.pc.readyState !== 1) {
+        rooms.delete(roomCode);
+        console.log(`[Relay] Room ${roomCode} deleted (empty)`);
       }
     }
   });
