@@ -50,10 +50,9 @@ wss.on("connection", (ws) => {
             ws.close();
             return;
           }
-          if (room.phone) {
-            ws.send(JSON.stringify({ type: "error", message: "Room already has a phone" }));
-            ws.close();
-            return;
+          // If there's already a phone, replace it (handles stale connections after network change)
+          if (room.phone && room.phone.readyState === 1) {
+            try { room.phone.close(); } catch {}
           }
           room.phone = ws;
           role = "phone";
@@ -90,15 +89,21 @@ wss.on("connection", (ws) => {
 
     console.log(`[Relay] ${role} disconnected from room ${roomCode}`);
 
-    // Notify the other peer
-    const peer = role === "pc" ? room.phone : room.pc;
-    if (peer?.readyState === 1) {
-      peer.send(JSON.stringify({ type: "peer_disconnected" }));
-      peer.close();
+    if (role === "pc") {
+      // PC disconnected → destroy room, notify and close phone
+      if (room.phone?.readyState === 1) {
+        room.phone.send(JSON.stringify({ type: "peer_disconnected" }));
+        room.phone.close();
+      }
+      rooms.delete(roomCode);
+    } else if (role === "phone") {
+      // Phone disconnected → keep room alive, just clear phone slot
+      // Phone can rejoin with same code after network change
+      room.phone = null;
+      if (room.pc?.readyState === 1) {
+        room.pc.send(JSON.stringify({ type: "peer_disconnected" }));
+      }
     }
-
-    // Clean up room
-    rooms.delete(roomCode);
   });
 
   ws.on("error", () => {
